@@ -1,0 +1,310 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pg-mm
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pg-secrets
+  namespace: pg-mm
+type: Opaque
+stringData:
+  POSTGRES_PASSWORD: postgres
+  REPL_USER: replicator
+  REPL_PASSWORD: replicator
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pg-conf
+  namespace: pg-mm
+data:
+  postgresql.conf: |
+    listen_addresses = '*'
+    wal_level = logical
+    max_wal_senders = 32
+    max_replication_slots = 32
+    wal_keep_size = '512MB'
+    shared_buffers = 256MB
+    hba_file = '/etc/postgresql/custom/pg_hba.conf'
+  pg_hba.conf: |
+    host all all 0.0.0.0/0 md5
+    host replication all 0.0.0.0/0 md5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-a
+  namespace: pg-mm
+spec:
+  clusterIP: None
+  selector: { app: pg-a }
+  ports:
+    - { name: pg, port: 5432, targetPort: 5432 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-a-node
+  namespace: pg-mm
+spec:
+  type: NodePort
+  selector: { app: pg-a }
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: 5432
+      nodePort: 31432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pg-a
+  namespace: pg-mm
+spec:
+  serviceName: pg-a
+  replicas: 1
+  selector: { matchLabels: { app: pg-a } }
+  template:
+    metadata: { labels: { app: pg-a } }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - { name: POSTGRES_USER, value: postgres }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: pg-secrets, key: POSTGRES_PASSWORD } }
+          ports: [ { containerPort: 5432 } ]
+          args: ["-c","config_file=/etc/postgresql/custom/postgresql.conf"]
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: conf, mountPath: /etc/postgresql/custom }
+          readinessProbe:
+            exec: { command: ["sh","-c","pg_isready -U postgres -d postgres -h 127.0.0.1 -p 5432"] }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: conf
+          configMap:
+            name: pg-conf
+            items:
+              - { key: postgresql.conf, path: postgresql.conf }
+              - { key: pg_hba.conf, path: pg_hba.conf }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 5Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-b
+  namespace: pg-mm
+spec:
+  clusterIP: None
+  selector: { app: pg-b }
+  ports:
+    - { name: pg, port: 5432, targetPort: 5432 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-b-node
+  namespace: pg-mm
+spec:
+  type: NodePort
+  selector: { app: pg-b }
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: 5432
+      nodePort: 32432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pg-b
+  namespace: pg-mm
+spec:
+  serviceName: pg-b
+  replicas: 1
+  selector: { matchLabels: { app: pg-b } }
+  template:
+    metadata: { labels: { app: pg-b } }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - { name: POSTGRES_USER, value: postgres }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: pg-secrets, key: POSTGRES_PASSWORD } }
+          ports: [ { containerPort: 5432 } ]
+          args: ["-c","config_file=/etc/postgresql/custom/postgresql.conf"]
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: conf, mountPath: /etc/postgresql/custom }
+          readinessProbe:
+            exec: { command: ["sh","-c","pg_isready -U postgres -d postgres -h 127.0.0.1 -p 5432"] }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: conf
+          configMap:
+            name: pg-conf
+            items:
+              - { key: postgresql.conf, path: postgresql.conf }
+              - { key: pg_hba.conf, path: pg_hba.conf }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 5Gi } }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: setup-sql
+  namespace: pg-mm
+data:
+  setup.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    export PGPASSWORD="${POSTGRES_PASSWORD}"
+    A_HOST="pg-a.pg-mm.svc.cluster.local"
+    B_HOST="pg-b.pg-mm.svc.cluster.local"
+    SYSDB="postgres"
+    DB="appdb"
+    PGUSER="postgres"
+    REPL_USER="$(cat /secrets/REPL_USER)"
+    REPL_PASSWORD="$(cat /secrets/REPL_PASSWORD)"
+    TABLES="public.test_mm"
+
+    # psql helpers (-X برای جلوگیری از implicit TX)
+    psqlA_sys(){ psql -X -h "$A_HOST" -U "$PGUSER" -d "$SYSDB" -v ON_ERROR_STOP=1 -c "$1"; }
+    psqlB_sys(){ psql -X -h "$B_HOST" -U "$PGUSER" -d "$SYSDB" -v ON_ERROR_STOP=1 -c "$1"; }
+    psqlA(){ psql -X -h "$A_HOST" -U "$PGUSER" -d "$DB" -v ON_ERROR_STOP=1 -c "$1"; }
+    psqlB(){ psql -X -h "$B_HOST" -U "$PGUSER" -d "$DB" -v ON_ERROR_STOP=1 -c "$1"; }
+    qA(){ psql -X -h "$A_HOST" -U "$PGUSER" -d "$DB" -tA -c "$1"; }
+    qB(){ psql -X -h "$B_HOST" -U "$PGUSER" -d "$DB" -tA -c "$1"; }
+    qA_sys(){ psql -X -h "$A_HOST" -U "$PGUSER" -d "$SYSDB" -tA -c "$1"; }
+    qB_sys(){ psql -X -h "$B_HOST" -U "$PGUSER" -d "$SYSDB" -tA -c "$1"; }
+    log(){ echo "[$(date +%H:%M:%S)] $*"; }
+
+    log "wait: postgres pods ready?"
+    for i in $(seq 1 300); do
+      pg_isready -h "$A_HOST" -p 5432 -d "$SYSDB" -U "$PGUSER" >/dev/null 2>&1 && \
+      pg_isready -h "$B_HOST" -p 5432 -d "$SYSDB" -U "$PGUSER" >/dev/null 2>&1 && break
+      sleep 2
+    done
+
+    log "db: ensure ${DB} exists on both"
+    [ "$(qA_sys "SELECT 1 FROM pg_database WHERE datname='${DB}'")" = "1" ] || psqlA_sys "CREATE DATABASE ${DB};"
+    [ "$(qB_sys "SELECT 1 FROM pg_database WHERE datname='${DB}'")" = "1" ] || psqlB_sys "CREATE DATABASE ${DB};"
+
+    log "role: ensure ${REPL_USER} on both"
+    [ "$(qA_sys "SELECT 1 FROM pg_roles WHERE rolname='${REPL_USER}'")" = "1" ] || psqlA_sys "CREATE ROLE ${REPL_USER} WITH LOGIN REPLICATION PASSWORD '${REPL_PASSWORD}';"
+    [ "$(qB_sys "SELECT 1 FROM pg_roles WHERE rolname='${REPL_USER}'")" = "1" ] || psqlB_sys "CREATE ROLE ${REPL_USER} WITH LOGIN REPLICATION PASSWORD '${REPL_PASSWORD}';"
+
+    log "grants: schema/table + default privileges"
+    psqlA "GRANT USAGE ON SCHEMA public TO ${REPL_USER}; GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${REPL_USER}; ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ${REPL_USER};"
+    psqlB "GRANT USAGE ON SCHEMA public TO ${REPL_USER}; GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${REPL_USER}; ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ${REPL_USER};"
+
+    log "tables: ensure demo + odd/even sequences"
+    # A (odd)
+    psqlA "CREATE TABLE IF NOT EXISTS public.test_mm( id BIGINT PRIMARY KEY, payload TEXT, updated_at TIMESTAMP DEFAULT now() );"
+    psqlA "CREATE SEQUENCE IF NOT EXISTS public.test_mm_id_seq INCREMENT BY 2 START WITH 1 OWNED BY public.test_mm.id;"
+    psqlA "ALTER TABLE public.test_mm ALTER COLUMN id SET DEFAULT nextval('public.test_mm_id_seq');"
+    psqlA "ALTER TABLE public.test_mm REPLICA IDENTITY DEFAULT;"
+    # B (even)
+    psqlB "CREATE TABLE IF NOT EXISTS public.test_mm( id BIGINT PRIMARY KEY, payload TEXT, updated_at TIMESTAMP DEFAULT now() );"
+    psqlB "CREATE SEQUENCE IF NOT EXISTS public.test_mm_id_seq INCREMENT BY 2 START WITH 2 OWNED BY public.test_mm.id;"
+    psqlB "ALTER TABLE public.test_mm ALTER COLUMN id SET DEFAULT nextval('public.test_mm_id_seq');"
+    psqlB "ALTER TABLE public.test_mm REPLICA IDENTITY DEFAULT;"
+
+    log "publications: ensure pub_app + add tables (idempotent)"
+    psqlA "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname='pub_app') THEN CREATE PUBLICATION pub_app; END IF; END \$\$;"
+    psqlB "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname='pub_app') THEN CREATE PUBLICATION pub_app; END IF; END \$$;"
+    psqlA "ALTER PUBLICATION pub_app SET (publish='insert,update,delete,truncate');"
+    psqlB "ALTER PUBLICATION pub_app SET (publish='insert,update,delete,truncate');"
+    for T in $TABLES; do
+      IN_A="$(qA "SELECT 1 FROM pg_publication_tables WHERE pubname='pub_app' AND schemaname=split_part('$T','.',1) AND tablename=split_part('$T','.',2);")"
+      [ "$IN_A" = "1" ] || psqlA "ALTER PUBLICATION pub_app ADD TABLE $T;"
+      IN_B="$(qB "SELECT 1 FROM pg_publication_tables WHERE pubname='pub_app' AND schemaname=split_part('$T','.',1) AND tablename=split_part('$T','.',2);")"
+      [ "$IN_B" = "1" ] || psqlB "ALTER PUBLICATION pub_app ADD TABLE $T;"
+    done
+
+    log "subs: drop old & create fresh (each step non-TX and escaped)"
+    # ---- A ← B ----
+    if [ "$(qA_sys "SELECT 1 FROM pg_subscription WHERE subname='sub_from_b';")" = "1" ]; then
+      psqlA "ALTER SUBSCRIPTION sub_from_b DISABLE;"
+      psqlA "DROP SUBSCRIPTION sub_from_b;"
+    fi
+    if [ "$(qB_sys "SELECT 1 FROM pg_replication_slots WHERE slot_name='slot_from_b';")" = "1" ]; then
+      psqlB_sys "SELECT pg_drop_replication_slot('slot_from_b');"
+    fi
+    psqlA "CREATE SUBSCRIPTION sub_from_b
+      CONNECTION 'host=${B_HOST} port=5432 dbname=${DB} user=${REPL_USER} password=${REPL_PASSWORD} application_name=sub_from_b'
+      PUBLICATION pub_app
+      WITH (create_slot=true, slot_name='slot_from_b', copy_data=true);"
+    psqlA "ALTER SUBSCRIPTION sub_from_b SET (origin = 'none');"
+
+    # ---- B ← A ----
+    if [ "$(qB_sys "SELECT 1 FROM pg_subscription WHERE subname='sub_from_a';")" = "1" ]; then
+      psqlB "ALTER SUBSCRIPTION sub_from_a DISABLE;"
+      psqlB "DROP SUBSCRIPTION sub_from_a;"
+    fi
+    if [ "$(qA_sys "SELECT 1 FROM pg_replication_slots WHERE slot_name='slot_from_a';")" = "1" ]; then
+      psqlA_sys "SELECT pg_drop_replication_slot('slot_from_a');"
+    fi
+    psqlB "CREATE SUBSCRIPTION sub_from_a
+      CONNECTION 'host=${A_HOST} port=5432 dbname=${DB} user=${REPL_USER} password=${REPL_PASSWORD} application_name=sub_from_a'
+      PUBLICATION pub_app
+      WITH (create_slot=true, slot_name='slot_from_a', copy_data=true);"
+    psqlB "ALTER SUBSCRIPTION sub_from_a SET (origin = 'none');"
+
+    log "enable + refresh"
+    psqlA "ALTER SUBSCRIPTION sub_from_b ENABLE;"
+    psqlB "ALTER SUBSCRIPTION sub_from_a ENABLE;"
+    psqlA "ALTER SUBSCRIPTION sub_from_b REFRESH PUBLICATION WITH (copy_data=false);"
+    psqlB "ALTER SUBSCRIPTION sub_from_a REFRESH PUBLICATION WITH (copy_data=false);"
+
+    log "done."
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: setup-mm
+  namespace: pg-mm
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: setup
+          image: postgres:16
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: pg-secrets, key: POSTGRES_PASSWORD } }
+          command: ["bash","/setup/setup.sh"]
+          volumeMounts:
+            - { name: setup, mountPath: /setup }
+            - { name: secrets, mountPath: /secrets }
+      volumes:
+        - name: setup
+          configMap:
+            name: setup-sql
+            defaultMode: 0755
+        - name: secrets
+          projected:
+            sources:
+              - secret:
+                  name: pg-secrets
+                  items:
+                    - { key: REPL_USER, path: REPL_USER }
+                    - { key: REPL_PASSWORD, path: REPL_PASSWORD }
