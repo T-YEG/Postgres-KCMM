@@ -96,5 +96,5 @@ kubectl delete ns pg-mm
   ALTER SUBSCRIPTION sub_from_b REFRESH PUBLICATION WITH (copy_data = false);
 
 ## 🧩 Author
-**@yourgithubusername**  
+**@T-YEG**  
 Automated PostgreSQL bi-directional replication on Kubernetes 🚀
